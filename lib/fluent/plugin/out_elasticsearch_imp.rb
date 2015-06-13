@@ -4,10 +4,10 @@ require 'excon'
 require 'elasticsearch'
 require 'uri'
 
-class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
+class Fluent::ElasticsearchImpOutput < Fluent::BufferedOutput
   class ConnectionFailure < StandardError; end
 
-  Fluent::Plugin.register_output('elasticsearch', self)
+  Fluent::Plugin.register_output('elasticsearch_imp', self)
 
   config_param :host, :string,  :default => 'localhost'
   config_param :port, :integer, :default => 9200
@@ -29,6 +29,9 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
   config_param :reload_on_failure, :bool, :default => false
   config_param :time_key, :string, :default => nil
   config_param :ssl_verify , :bool, :default => true
+  config_param :merge_log, :bool, :default => false
+  config_param :merge_interval, :integer, :default => 1
+  config_param :merge_key, :string, :default => "log"
 
   include Fluent::SetTagKeyMixin
   config_set_default :include_tag_key, false
@@ -122,8 +125,10 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
 
   def write(chunk)
     bulk_message = []
-
+    record_store = {}
+    time_store = {}
     chunk.msgpack_each do |tag, time, record|
+      log.info "tag => #{tag}, time => #{time}"
       next unless record.is_a? Hash
       if @logstash_format
         if record.has_key?("@timestamp")
@@ -155,11 +160,38 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
       if @parent_key && record[@parent_key]
         meta['index']['_parent'] = record[@parent_key]
       end
-
-      bulk_message << meta
-      bulk_message << record
+      
+      # try to merge log
+      if @merge_log
+        # check the tag exists
+        if time_store.has_key?(tag)
+          # check in the merge time window
+          if time_store[tag] + @merge_interval < time
+            bulk_message << record_store[tag][:meta]
+            bulk_message << record_store[tag][:record]
+            time_store[tag] = time
+            record_store[tag] = { :meta => meta, :record => record }
+          else
+            # do merge
+            record_store[tag][:record][@merge_key] << record[@merge_key]
+          end
+        else
+          time_store[tag] = time
+          record_store[tag] = { :meta => meta, :record => record }
+        end
+      else
+        bulk_message << meta
+        bulk_message << record
+      end
     end
 
+    if @merge_log
+      record_store.each do |key, item|
+        bulk_message << item[:meta]
+        bulk_message << item[:record]
+      end
+    end
+    log.info "send result => #{bulk_message}"
     send(bulk_message) unless bulk_message.empty?
     bulk_message.clear
   end
